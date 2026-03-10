@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!--
+  Minimal representation of the Azure B2C SAML auto-post page returned by the
+  confirmed endpoint after successful authentication.  The browser auto-submits
+  this form to the SAP portal's SAML handler.
+-->
+<html>
+<head><title>Working...</title></head>
+<body onload="document.forms[0].submit()">
+<form method="POST"
+      action="https://webservices.minol.com/minol.com~kundenportal~login~saml/?logonTargetUrl=https%3A%2F%2Fwebservices.minol.com%2F%3Fredirect2%3Dtrue&saml2idp=B2C-Minol-Tenant">
+  <input type="hidden" name="SAMLResponse" value="FAKESAMLBASE64RESPONSEVALUE" />
+  <input type="hidden" name="RelayState"   value="ouccparpccpc" />
+  <input type="hidden" name="saml2post"    value="false" />
+</form>
+</body>
+</html>

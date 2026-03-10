@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!--
+  Minimal representation of the Azure B2C custom-policy login page rendered by
+  B2C_1A_Signup_Signin_Groups_SAML.  Matches the real page structure observed
+  from the Minol portal (field ID is "signInName", SETTINGS object present).
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Minol Login</title>
+</head>
+<body>
+
+<script type="text/javascript">
+var SETTINGS = {"api":"CombinedSigninAndSignup","csrf":"FAKECSRFTOKENFROMPAGE","transId":"StateProperties=AAABBBCCC","hosts":{"tenant":"/minolauth.onmicrosoft.com/B2C_1A_Signup_Signin_Groups_SAML","policy":"B2C_1A_Signup_Signin_Groups_SAML","static":"https://minolauth.b2clogin.com/static/"}};
+var SA_FIELDS = {"AttributeFields":[{"ID":"signInName","DN":"E-Mail address","UX_INPUT_TYPE":"TextBox","IS_REQ":true},{"ID":"password","DN":"Password","UX_INPUT_TYPE":"Password","IS_REQ":true}]};
+</script>
+
+<div id="api">
+  <form id="localAccountForm"
+        action="https://minolauth.b2clogin.com/minolauth.onmicrosoft.com/B2C_1A_Signup_Signin_Groups_SAML/SelfAsserted?tx=StateProperties=AAABBBCCC&p=B2C_1A_Signup_Signin_Groups_SAML"
+        method="POST">
+    <input type="hidden" name="tx"           value="StateProperties=AAABBBCCC" />
+    <input type="hidden" name="p"            value="B2C_1A_Signup_Signin_Groups_SAML" />
+    <input type="hidden" name="request_type" value="RESPONSE" />
+
+    <div>
+      <label for="signInName">Email</label>
+      <input type="email" id="signInName" name="signInName"
+             autocomplete="username" />
+    </div>
+    <div>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password"
+             autocomplete="current-password" />
+    </div>
+
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body>
+</html>
