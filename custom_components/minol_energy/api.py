@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlunparse
 
 import aiohttp
 
 from .const import (
     BASE_URL,
     EMDATA_REST,
-    J_SECURITY_CHECK_URL,
-    LOGIN_URL,
+    LOGIN_ENTRY_URL,
     NUDATA_REST,
     USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# String that only appears on an authenticated SAP portal page.
+_PORTAL_AUTH_MARKER = "Liegenschaft"
 
 
 class MinolAuthError(Exception):
@@ -28,13 +33,130 @@ class MinolConnectionError(Exception):
     """Raised when the Minol portal cannot be reached."""
 
 
+# ---------------------------------------------------------------------------
+# B2C / SAML page helpers (module-level for testability)
+# ---------------------------------------------------------------------------
+
+class _B2CFormParser(HTMLParser):
+    """Extract the first (or #localAccountForm) form and its hidden fields."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_form = False
+        self.action: str | None = None
+        self.fields: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        d = dict(attrs)
+        if tag == "form":
+            if d.get("id") == "localAccountForm" or self.action is None:
+                self._in_form = True
+                self.action = d.get("action") or ""
+        elif tag == "input" and self._in_form:
+            if d.get("type") == "hidden" and d.get("name"):
+                self.fields[d["name"]] = d.get("value") or ""
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form":
+            self._in_form = False
+
+
+def _parse_b2c_login_form(html: str, page_url: str) -> tuple[str, dict[str, str]]:
+    """Return (absolute_action_url, hidden_fields) from a B2C login page.
+
+    Raises MinolAuthError if no parseable form is found.
+    """
+    parser = _B2CFormParser()
+    parser.feed(html)
+
+    if not parser.action:
+        raise MinolAuthError("B2C login form not found in page")
+
+    action = parser.action
+    if not action.startswith("http"):
+        action = urljoin(page_url, action)
+
+    return action, parser.fields
+
+
+def _extract_b2c_csrf(html: str) -> str:
+    """Extract the CSRF token from the SETTINGS JS object on the B2C login page.
+
+    Azure B2C embeds ``var SETTINGS = {...}`` in the page.  The ``csrf`` field
+    is the token required for the confirmed endpoint – more reliable than the
+    ``x-ms-cpim-csrf`` cookie (which aiohttp may not receive in all setups).
+    Returns an empty string when the pattern is not found.
+    """
+    match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
+    return match.group(1) if match else ""
+
+
+def _build_confirmed_url(self_asserted_url: str, csrf_token: str) -> str:
+    """Derive the B2C 'confirmed' URL from the SelfAsserted action URL.
+
+    Azure B2C custom policies complete the auth flow when the client GETs:
+      .../api/CombinedSigninAndSignup/confirmed?rememberMe=false
+          &csrf_token=<SETTINGS.csrf>
+          &tx=<from original query>&p=<policy name>
+    """
+    parsed = urlparse(self_asserted_url)
+    path = re.sub(r"/SelfAsserted$", "/api/CombinedSigninAndSignup/confirmed", parsed.path)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    confirmed_qs = urlencode({
+        "rememberMe": "false",
+        "csrf_token": csrf_token,
+        "tx": qs.get("tx", [""])[0],
+        "p": qs.get("p", [""])[0],
+    })
+    return urlunparse(parsed._replace(path=path, query=confirmed_qs))
+
+
+def _parse_saml_post_form(html: str, page_url: str) -> tuple[str, dict[str, str]]:
+    """Parse the SAML auto-post form returned by the B2C confirmed endpoint.
+
+    Azure B2C delivers the SAML Response as an HTML page containing a form
+    that the browser auto-submits to the portal's SAML handler.  We parse that
+    form to replicate the submission.
+
+    Returns (absolute_action_url, form_fields_including_SAMLResponse).
+    Raises MinolAuthError if no form or no SAMLResponse field is found.
+    """
+    parser = _B2CFormParser()
+    parser.feed(html)
+
+    if not parser.action:
+        raise MinolAuthError("SAML auto-post form not found in B2C response")
+    if "SAMLResponse" not in parser.fields:
+        raise MinolAuthError("SAMLResponse field missing from B2C auto-post form")
+
+    action = parser.action
+    if not action.startswith("http"):
+        action = urljoin(page_url, action)
+
+    return action, parser.fields
+
+
+# ---------------------------------------------------------------------------
+# API client
+# ---------------------------------------------------------------------------
+
 class MinolApiClient:
     """Async client for the Minol eMonitoring portal.
 
-    Authentication flow:
-      1. GET the SAP NetWeaver login page to seed session cookies.
-      2. POST credentials to ``j_security_check``.
-      3. Verify MYSAPSSO2 cookie was issued.
+    Authentication flow (Azure B2C → SAML → SAP portal):
+      1. GET the portal entry point; follow redirects to the B2C login page.
+      2. Parse SETTINGS.csrf and the ``localAccountForm`` (SelfAsserted endpoint).
+      3. POST credentials; B2C returns ``{"status": "200"}`` JSON on success.
+      4. GET the ``confirmed`` URL → B2C returns an HTML auto-post form with
+         the SAML Response.
+      5. POST the SAML Response to the portal's SAML handler; follow redirects
+         back to the portal landing page.
+      6. Verify authentication by checking for a known string ("Liegenschaft")
+         that only appears on an authenticated portal page.
+
+    Note on MYSAPSSO2: the portal sets this cookie via JavaScript, not via an
+    HTTP Set-Cookie header.  A headless HTTP client therefore never receives it
+    in the cookie jar; we verify login via portal content instead.
 
     Data flow (for a *tenant* / Mieter user):
       1. GET ``EMData/getUserTenants`` → tenant list with ``userNumber``.
@@ -69,38 +191,71 @@ class MinolApiClient:
     # ------------------------------------------------------------------
 
     async def authenticate(self) -> bool:
-        """Login via SAP j_security_check.  Returns True on success."""
+        """Login via Azure B2C → SAML → SAP portal. Returns True on success."""
         session = self._ensure_session()
 
         try:
-            # Seed SAP cookies.
-            async with session.get(LOGIN_URL, allow_redirects=True):
-                pass
+            # 1. Hit the portal entry; follow redirects to the B2C login page.
+            async with session.get(LOGIN_ENTRY_URL, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    raise MinolAuthError(
+                        f"B2C login page returned HTTP {resp.status}"
+                    )
+                page_url = str(resp.url)
+                html = await resp.text()
 
-            # Submit credentials.
+            # 2. Parse login form + extract CSRF from SETTINGS.csrf.
+            action_url, form_data = _parse_b2c_login_form(html, page_url)
+            csrf_token = _extract_b2c_csrf(html)
+
+            form_data["signInName"] = self._username
+            form_data["password"] = self._password
+            form_data["request_type"] = "RESPONSE"
+
+            # 3. POST credentials to the SelfAsserted endpoint.
             async with session.post(
-                J_SECURITY_CHECK_URL,
-                data={"j_user": self._username, "j_password": self._password},
-                allow_redirects=True,
+                action_url, data=form_data, allow_redirects=True
             ) as resp:
-                # Check for the SSO cookie that SAP issues on success.
-                cookie_names = {c.key for c in session.cookie_jar}
-                if "MYSAPSSO2" not in cookie_names:
-                    raise MinolAuthError(
-                        "Authentication failed – no MYSAPSSO2 cookie received"
-                    )
+                content_type = resp.headers.get("Content-Type", "")
+                if "json" in content_type:
+                    body = await resp.json(content_type=None)
+                    if str(body.get("status")) != "200":
+                        raise MinolAuthError(
+                            "B2C login rejected: "
+                            f"{body.get('message', 'invalid credentials')}"
+                        )
 
-                # Extra safety: make sure we weren't bounced back to logon.
-                final = str(resp.url).lower()
-                if "j_security_check" in final:
-                    raise MinolAuthError(
-                        "Authentication failed – redirected back to login"
+                    # 4. GET the confirmed URL → HTML page with SAML auto-post form.
+                    #    We do NOT follow redirects so we can read the response body.
+                    confirmed_url = _build_confirmed_url(action_url, csrf_token)
+                    async with session.get(
+                        confirmed_url, allow_redirects=False
+                    ) as confirmed_resp:
+                        confirmed_html = await confirmed_resp.text()
+
+                    # 5. Parse and submit the SAML auto-post form to the portal.
+                    saml_action, saml_data = _parse_saml_post_form(
+                        confirmed_html, confirmed_url
                     )
+                    async with session.post(
+                        saml_action, data=saml_data, allow_redirects=True
+                    ) as portal_resp:
+                        portal_html = await portal_resp.text()
+
+                # If not JSON, the POST was already redirected to the portal.
+                else:
+                    portal_html = await resp.text()
 
         except aiohttp.ClientError as err:
             raise MinolConnectionError(
                 f"Cannot reach Minol portal: {err}"
             ) from err
+
+        # 6. Verify we landed on an authenticated portal page.
+        if _PORTAL_AUTH_MARKER not in portal_html:
+            raise MinolAuthError(
+                f"Authentication failed – '{_PORTAL_AUTH_MARKER}' not found in portal page"
+            )
 
         _LOGGER.debug("Minol authentication successful")
         return True
@@ -250,11 +405,7 @@ class MinolApiClient:
         return await self._post_json(f"{EMDATA_REST}/readData", selection)
 
     async def get_all_data(self) -> dict[str, Any]:
-        """Collect all data needed by the integration sensors.
-
-        Returns a dict with ``tenants``, ``layer_info``, ``dashboard``,
-        and ``rooms`` (per-meter / per-room data).
-        """
+        """Collect all data needed by the integration sensors."""
         tenants = await self.get_user_tenants()
         user_num = tenants[0]["userNumber"] if tenants else None
         tenant_info = tenants[0] if tenants else {}
@@ -262,7 +413,6 @@ class MinolApiClient:
         layer_info = await self.get_layer_info(user_num)
         dashboard = await self.get_dashboard(user_num)
 
-        # Fetch per-room data for every RAUM view available.
         rooms: dict[str, list[dict[str, Any]]] = {}
         raum_views = {
             "100EHRAUM": "HEIZUNG",

@@ -3,6 +3,11 @@
 DOMAIN = "minol_energy"
 
 BASE_URL = "https://webservices.minol.com"
+
+# Entry point that triggers the SAML/Azure B2C redirect flow.
+LOGIN_ENTRY_URL = f"{BASE_URL}/?redirect2=true"
+
+# Legacy SAP form-based login – no longer used, kept for reference.
 LOGIN_URL = (
     f"{BASE_URL}/irj/servlet/prt/portal/prttarget/uidpwlogon"
     "/prtroot/com.sap.portal.navigation.portallauncher.default"
