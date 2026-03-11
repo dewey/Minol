@@ -2,24 +2,24 @@
   "config": {
     "step": {
       "user": {
-        "title": "Minol eMonitoring Anmeldung",
-        "description": "Geben Sie Ihre Zugangsdaten f\u00fcr das Minol Mieterportal ein (webservices.minol.com).",
+        "title": "Minol Energy – Anmeldung",
+        "description": "**Schritt 1:** Öffnen Sie den folgenden Link in Ihrem Browser und melden Sie sich mit Ihrem Minol-Konto an:\n\n[Minol-Anmeldung öffnen]({auth_url})\n\n**Schritt 2:** Nach der Anmeldung leitet der Browser zu einer Postman-Seite weiter. Kopieren Sie die **vollständige URL** aus der Adressleiste (beginnt mit `https://oauth.pstmn.io/v1/callback?code=…`) und fügen Sie sie unten ein.",
         "data": {
-          "username": "Benutzername (E-Mail)",
-          "password": "Passwort"
+          "redirect_url": "Weiterleitungs-URL (aus der Adressleiste des Browsers einfügen)"
         }
       },
       "reauth_confirm": {
-        "title": "Minol eMonitoring erneut anmelden",
-        "description": "Ihre Sitzung ist abgelaufen. Bitte geben Sie Ihr Passwort erneut ein.",
+        "title": "Minol Energy – Erneut anmelden",
+        "description": "Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an.\n\n**Schritt 1:** Öffnen Sie den folgenden Link in Ihrem Browser:\n\n[Minol-Anmeldung öffnen]({auth_url})\n\n**Schritt 2:** Nach der Anmeldung kopieren Sie die vollständige URL aus der Adressleiste (beginnt mit `https://oauth.pstmn.io/v1/callback?code=…`) und fügen Sie sie unten ein.",
         "data": {
-          "password": "Passwort"
+          "redirect_url": "Weiterleitungs-URL (aus der Adressleiste des Browsers einfügen)"
         }
       }
     },
     "error": {
-      "invalid_auth": "Ung\u00fcltige Anmeldedaten. Kein MYSAPSSO2-Cookie erhalten.",
-      "cannot_connect": "Verbindung zum Minol-Portal nicht m\u00f6glich.",
+      "invalid_auth": "Token-Austausch fehlgeschlagen. Bitte versuchen Sie es erneut.",
+      "cannot_connect": "Verbindung zur Minol-API nicht möglich.",
+      "invalid_redirect_url": "Die eingefügte URL enthält keinen Autorisierungscode. Stellen Sie sicher, dass Sie die vollständige URL aus der Adressleiste kopiert haben.",
       "unknown": "Ein unerwarteter Fehler ist aufgetreten."
     },
     "abort": {
@@ -33,9 +33,9 @@
         "title": "Minol Energy Einstellungen",
         "data": {
           "scan_interval": "Aktualisierungsintervall (Minuten)",
-          "heating_price": "Heizungspreis (\u20ac/kWh)",
-          "hot_water_price": "Warmwasserpreis (\u20ac/kWh)",
-          "cold_water_price": "Kaltwasserpreis (\u20ac/m\u00b3)"
+          "heating_price": "Heizungspreis (€/kWh)",
+          "hot_water_price": "Warmwasserpreis (€/kWh)",
+          "cold_water_price": "Kaltwasserpreis (€/m³)"
         }
       }
     }

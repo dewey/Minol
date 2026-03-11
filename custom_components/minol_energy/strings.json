@@ -2,24 +2,24 @@
   "config": {
     "step": {
       "user": {
-        "title": "Minol eMonitoring Login",
-        "description": "Enter your Minol tenant portal credentials (webservices.minol.com).",
+        "title": "Minol Energy – Sign In",
+        "description": "**Step 1:** Open the link below in your browser and sign in with your Minol account:\n\n[Open Minol login]({auth_url})\n\n**Step 2:** After signing in, your browser will navigate to a Postman page. Copy the **full URL** from the address bar (it starts with `https://oauth.pstmn.io/v1/callback?code=…`) and paste it below.",
         "data": {
-          "username": "Username (e-mail)",
-          "password": "Password"
+          "redirect_url": "Redirect URL (paste from browser address bar)"
         }
       },
       "reauth_confirm": {
-        "title": "Re-authenticate Minol eMonitoring",
-        "description": "Your session has expired. Please enter your password again.",
+        "title": "Minol Energy – Re-authenticate",
+        "description": "Your session has expired. Please sign in again.\n\n**Step 1:** Open the link below in your browser:\n\n[Open Minol login]({auth_url})\n\n**Step 2:** After signing in, copy the full URL from the browser address bar (starts with `https://oauth.pstmn.io/v1/callback?code=…`) and paste it below.",
         "data": {
-          "password": "Password"
+          "redirect_url": "Redirect URL (paste from browser address bar)"
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid username or password. No MYSAPSSO2 cookie received.",
-      "cannot_connect": "Cannot connect to the Minol portal.",
+      "invalid_auth": "Token exchange failed. Please try again.",
+      "cannot_connect": "Cannot connect to the Minol API.",
+      "invalid_redirect_url": "The pasted URL does not contain an authorization code. Make sure you copied the full URL from the browser address bar after signing in.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {
@@ -33,9 +33,9 @@
         "title": "Minol Energy Options",
         "data": {
           "scan_interval": "Update interval (minutes)",
-          "heating_price": "Heating price (\u20ac/kWh)",
-          "hot_water_price": "Hot water price (\u20ac/kWh)",
-          "cold_water_price": "Cold water price (\u20ac/m\u00b3)"
+          "heating_price": "Heating price (€/kWh)",
+          "hot_water_price": "Hot water price (€/kWh)",
+          "cold_water_price": "Cold water price (€/m³)"
         }
       }
     }

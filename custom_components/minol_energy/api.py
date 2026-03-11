@@ -1,173 +1,118 @@
-"""API client for the Minol tenant portal (SAP NetWeaver eMonitoring)."""
+"""API client for the Minol mobile app backend (Mulesoft Experience API).
+
+Authentication flow (Azure B2C OAuth2 → Bearer token):
+  1. The config flow obtains tokens via Authorization Code + PKCE (browser login).
+  2. The access_token and refresh_token are stored in the config entry.
+  3. The access_token is attached as ``Authorization: Bearer <token>`` on every
+     API request, together with the shared Mulesoft client_id / client_secret.
+  4. When the access_token expires, the client refreshes silently using the
+     refresh_token.  On failure it raises MinolAuthError so the coordinator
+     can trigger HA's re-authentication flow.
+
+Data flow:
+  1. GET ``/profiles`` → user profile containing billingUnit + residentialUnitID.
+  2. GET ``/billingUnit/{bu}/residentialUnit/{ru}/masterdata`` → billing periods.
+  3. GET ``/billingUnit/{bu}/residentialUnit/{ru}/consumptions/availableData``
+     → list of available consumption periods.
+  4. GET ``/billingUnit/{bu}/residentialUnit/{ru}/consumptions?startdate=…&enddate=…``
+     → consumption values per service (heating / hot water / cold water).
+
+Reverse-engineered from MinolApp v2.11.14 APK (com.minol.minolapp).
+
+Enable debug logging in configuration.yaml to see full request/response details:
+  logger:
+    logs:
+      custom_components.minol_energy: debug
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-import re
-from html.parser import HTMLParser
+import uuid
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlencode, urljoin, urlparse, parse_qs, urlunparse
 
 import aiohttp
 
 from .const import (
-    BASE_URL,
-    EMDATA_REST,
-    LOGIN_ENTRY_URL,
-    NUDATA_REST,
+    API_BASE_URL,
+    API_CLIENT_ID,
+    API_CLIENT_SECRET,
+    APP_VERSION,
+    B2C_CLIENT_ID,
+    B2C_CLIENT_SECRET,
+    B2C_REDIRECT_URI,
+    B2C_SCOPES,
+    B2C_TOKEN_URL,
     USER_AGENT,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# String that only appears on an authenticated SAP portal page.
-_PORTAL_AUTH_MARKER = "Liegenschaft"
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 
 class MinolAuthError(Exception):
-    """Raised when authentication with the Minol portal fails."""
+    """Raised when the token is expired and refresh fails – triggers reauth."""
 
 
 class MinolConnectionError(Exception):
-    """Raised when the Minol portal cannot be reached."""
-
-
-# ---------------------------------------------------------------------------
-# B2C / SAML page helpers (module-level for testability)
-# ---------------------------------------------------------------------------
-
-class _B2CFormParser(HTMLParser):
-    """Extract the first (or #localAccountForm) form and its hidden fields."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._in_form = False
-        self.action: str | None = None
-        self.fields: dict[str, str] = {}
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        d = dict(attrs)
-        if tag == "form":
-            if d.get("id") == "localAccountForm" or self.action is None:
-                self._in_form = True
-                self.action = d.get("action") or ""
-        elif tag == "input" and self._in_form:
-            if d.get("type") == "hidden" and d.get("name"):
-                self.fields[d["name"]] = d.get("value") or ""
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "form":
-            self._in_form = False
-
-
-def _parse_b2c_login_form(html: str, page_url: str) -> tuple[str, dict[str, str]]:
-    """Return (absolute_action_url, hidden_fields) from a B2C login page.
-
-    Raises MinolAuthError if no parseable form is found.
-    """
-    parser = _B2CFormParser()
-    parser.feed(html)
-
-    if not parser.action:
-        raise MinolAuthError("B2C login form not found in page")
-
-    action = parser.action
-    if not action.startswith("http"):
-        action = urljoin(page_url, action)
-
-    return action, parser.fields
-
-
-def _extract_b2c_csrf(html: str) -> str:
-    """Extract the CSRF token from the SETTINGS JS object on the B2C login page.
-
-    Azure B2C embeds ``var SETTINGS = {...}`` in the page.  The ``csrf`` field
-    is the token required for the confirmed endpoint – more reliable than the
-    ``x-ms-cpim-csrf`` cookie (which aiohttp may not receive in all setups).
-    Returns an empty string when the pattern is not found.
-    """
-    match = re.search(r'"csrf"\s*:\s*"([^"]+)"', html)
-    return match.group(1) if match else ""
-
-
-def _build_confirmed_url(self_asserted_url: str, csrf_token: str) -> str:
-    """Derive the B2C 'confirmed' URL from the SelfAsserted action URL.
-
-    Azure B2C custom policies complete the auth flow when the client GETs:
-      .../api/CombinedSigninAndSignup/confirmed?rememberMe=false
-          &csrf_token=<SETTINGS.csrf>
-          &tx=<from original query>&p=<policy name>
-    """
-    parsed = urlparse(self_asserted_url)
-    path = re.sub(r"/SelfAsserted$", "/api/CombinedSigninAndSignup/confirmed", parsed.path)
-    qs = parse_qs(parsed.query, keep_blank_values=True)
-    confirmed_qs = urlencode({
-        "rememberMe": "false",
-        "csrf_token": csrf_token,
-        "tx": qs.get("tx", [""])[0],
-        "p": qs.get("p", [""])[0],
-    })
-    return urlunparse(parsed._replace(path=path, query=confirmed_qs))
-
-
-def _parse_saml_post_form(html: str, page_url: str) -> tuple[str, dict[str, str]]:
-    """Parse the SAML auto-post form returned by the B2C confirmed endpoint.
-
-    Azure B2C delivers the SAML Response as an HTML page containing a form
-    that the browser auto-submits to the portal's SAML handler.  We parse that
-    form to replicate the submission.
-
-    Returns (absolute_action_url, form_fields_including_SAMLResponse).
-    Raises MinolAuthError if no form or no SAMLResponse field is found.
-    """
-    parser = _B2CFormParser()
-    parser.feed(html)
-
-    if not parser.action:
-        raise MinolAuthError("SAML auto-post form not found in B2C response")
-    if "SAMLResponse" not in parser.fields:
-        raise MinolAuthError("SAMLResponse field missing from B2C auto-post form")
-
-    action = parser.action
-    if not action.startswith("http"):
-        action = urljoin(page_url, action)
-
-    return action, parser.fields
+    """Raised when the Minol API cannot be reached."""
 
 
 # ---------------------------------------------------------------------------
 # API client
 # ---------------------------------------------------------------------------
 
+
 class MinolApiClient:
-    """Async client for the Minol eMonitoring portal.
+    """Async client for the Minol mobile app backend (Mulesoft API).
 
-    Authentication flow (Azure B2C → SAML → SAP portal):
-      1. GET the portal entry point; follow redirects to the B2C login page.
-      2. Parse SETTINGS.csrf and the ``localAccountForm`` (SelfAsserted endpoint).
-      3. POST credentials; B2C returns ``{"status": "200"}`` JSON on success.
-      4. GET the ``confirmed`` URL → B2C returns an HTML auto-post form with
-         the SAML Response.
-      5. POST the SAML Response to the portal's SAML handler; follow redirects
-         back to the portal landing page.
-      6. Verify authentication by checking for a known string ("Liegenschaft")
-         that only appears on an authenticated portal page.
+    Takes OAuth2 tokens obtained via the config flow (Authorization Code + PKCE).
+    Silently refreshes the access_token using the refresh_token when needed.
 
-    Note on MYSAPSSO2: the portal sets this cookie via JavaScript, not via an
-    HTTP Set-Cookie header.  A headless HTTP client therefore never receives it
-    in the cookie jar; we verify login via portal content instead.
+    Usage::
 
-    Data flow (for a *tenant* / Mieter user):
-      1. GET ``EMData/getUserTenants`` → tenant list with ``userNumber``.
-      2. POST ``EMData/getLayerInfo`` → available views & periods.
-      3. POST ``EMData/readData`` (dashboard) → current consumption values.
+        client = MinolApiClient(
+            access_token="eyJ...",
+            refresh_token="0.A...",
+            on_tokens_refreshed=lambda a, r: save_tokens(a, r),
+        )
+        data = await client.get_all_data()
+        await client.close()
     """
 
-    def __init__(self, username: str, password: str) -> None:
-        self._username = username
-        self._password = password
+    def __init__(
+        self,
+        access_token: str,
+        refresh_token: str | None = None,
+        on_tokens_refreshed: Callable[[str, str | None], None] | None = None,
+    ) -> None:
+        self._access_token = access_token
+        self._refresh_token = refresh_token
+        self._on_tokens_refreshed = on_tokens_refreshed
         self._session: aiohttp.ClientSession | None = None
+        # Proactive refresh: track when the access token expires
+        self._token_expiry: datetime | None = None
+
+    def set_token_expiry(self, expires_in: int) -> None:
+        """Record when the current access token expires (seconds from now)."""
+        self._token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        _LOGGER.debug(
+            "Access token expires at %s (in %d s)",
+            self._token_expiry.isoformat(),
+            expires_in,
+        )
+
+    def _is_token_expired(self) -> bool:
+        """Return True if the access token has expired or will within 60 s."""
+        if self._token_expiry is None:
+            return False
+        return datetime.now(timezone.utc) >= self._token_expiry - timedelta(seconds=60)
 
     # ------------------------------------------------------------------
     # Session management
@@ -177,7 +122,6 @@ class MinolApiClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 headers={"User-Agent": USER_AGENT},
-                cookie_jar=aiohttp.CookieJar(unsafe=True),
             )
         return self._session
 
@@ -187,253 +131,378 @@ class MinolApiClient:
             self._session = None
 
     # ------------------------------------------------------------------
-    # Authentication
+    # Token refresh (silent)
     # ------------------------------------------------------------------
 
-    async def authenticate(self) -> bool:
-        """Login via Azure B2C → SAML → SAP portal. Returns True on success."""
+    async def _refresh_access_token(self) -> bool:
+        """Silently refresh the access token using the stored refresh token."""
+        if not self._refresh_token:
+            _LOGGER.warning(
+                "Token refresh requested but no refresh_token is stored."
+                " Re-authentication will be required."
+            )
+            return False
+
+        _LOGGER.debug("Attempting silent token refresh via B2C: %s", B2C_TOKEN_URL)
         session = self._ensure_session()
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": self._refresh_token,
+            "client_id": B2C_CLIENT_ID,
+            "client_secret": B2C_CLIENT_SECRET,
+            "redirect_uri": B2C_REDIRECT_URI,
+            "scope": B2C_SCOPES,
+        }
 
         try:
-            # 1. Hit the portal entry; follow redirects to the B2C login page.
-            async with session.get(LOGIN_ENTRY_URL, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    raise MinolAuthError(
-                        f"B2C login page returned HTTP {resp.status}"
-                    )
-                page_url = str(resp.url)
-                html = await resp.text()
-
-            # 2. Parse login form + extract CSRF from SETTINGS.csrf.
-            action_url, form_data = _parse_b2c_login_form(html, page_url)
-            csrf_token = _extract_b2c_csrf(html)
-
-            form_data["signInName"] = self._username
-            form_data["password"] = self._password
-            form_data["request_type"] = "RESPONSE"
-
-            # 3. POST credentials to the SelfAsserted endpoint.
             async with session.post(
-                action_url, data=form_data, allow_redirects=True
+                B2C_TOKEN_URL,
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
             ) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                if "json" in content_type:
-                    body = await resp.json(content_type=None)
-                    if str(body.get("status")) != "200":
-                        raise MinolAuthError(
-                            "B2C login rejected: "
-                            f"{body.get('message', 'invalid credentials')}"
-                        )
-
-                    # 4. GET the confirmed URL → HTML page with SAML auto-post form.
-                    #    We do NOT follow redirects so we can read the response body.
-                    confirmed_url = _build_confirmed_url(action_url, csrf_token)
-                    async with session.get(
-                        confirmed_url, allow_redirects=False
-                    ) as confirmed_resp:
-                        confirmed_html = await confirmed_resp.text()
-
-                    # 5. Parse and submit the SAML auto-post form to the portal.
-                    saml_action, saml_data = _parse_saml_post_form(
-                        confirmed_html, confirmed_url
+                body = await resp.text()
+                if resp.status != 200:
+                    try:
+                        err = json.loads(body)
+                        desc = err.get("error_description") or err.get("error") or body
+                    except Exception:
+                        desc = body
+                    _LOGGER.warning(
+                        "Token refresh failed (HTTP %s): %s", resp.status, desc[:300]
                     )
-                    async with session.post(
-                        saml_action, data=saml_data, allow_redirects=True
-                    ) as portal_resp:
-                        portal_html = await portal_resp.text()
+                    return False
 
-                # If not JSON, the POST was already redirected to the portal.
-                else:
-                    portal_html = await resp.text()
+                token_data = json.loads(body)
+                new_token = token_data.get("access_token")
+                if not new_token:
+                    _LOGGER.warning(
+                        "Token refresh response did not contain access_token: %s",
+                        body[:200],
+                    )
+                    return False
+
+                self._access_token = new_token
+                self._refresh_token = token_data.get(
+                    "refresh_token", self._refresh_token
+                )
+                expires_in = token_data.get("expires_in", 3600)
+                self.set_token_expiry(int(expires_in))
+
+                _LOGGER.debug(
+                    "Token refreshed successfully (expires_in=%s s)", expires_in
+                )
+                if self._on_tokens_refreshed:
+                    self._on_tokens_refreshed(self._access_token, self._refresh_token)
+                return True
 
         except aiohttp.ClientError as err:
-            raise MinolConnectionError(
-                f"Cannot reach Minol portal: {err}"
-            ) from err
-
-        # 6. Verify we landed on an authenticated portal page.
-        if _PORTAL_AUTH_MARKER not in portal_html:
-            raise MinolAuthError(
-                f"Authentication failed – '{_PORTAL_AUTH_MARKER}' not found in portal page"
-            )
-
-        _LOGGER.debug("Minol authentication successful")
-        return True
+            _LOGGER.warning("Network error during token refresh: %s", err)
+            return False
+        except Exception as err:
+            _LOGGER.warning("Unexpected error during token refresh: %s", err)
+            return False
 
     # ------------------------------------------------------------------
-    # Low-level helpers
+    # Low-level API helpers
     # ------------------------------------------------------------------
 
-    async def _get_json(self, url: str, **kwargs: Any) -> Any:
-        """GET *url* and return parsed JSON.  Re-authenticates once on 401/403."""
-        return await self._request("GET", url, **kwargs)
+    def _api_headers(self) -> dict[str, str]:
+        """Build the headers required by every Mulesoft API request."""
+        return {
+            "Authorization": f"Bearer {self._access_token}",
+            "client_id": API_CLIENT_ID,
+            "client_secret": API_CLIENT_SECRET,
+            "correlationId": str(uuid.uuid4()),
+            "appVersion": APP_VERSION,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
 
-    async def _post_json(self, url: str, payload: Any = None, **kwargs: Any) -> Any:
-        """POST *url* with a JSON body and return parsed JSON."""
-        return await self._request("POST", url, payload=payload, **kwargs)
+    def _url(self, path: str) -> str:
+        return f"{API_BASE_URL}{path}"
 
     async def _request(
         self,
         method: str,
-        url: str,
+        path: str,
+        params: dict[str, str] | None = None,
         payload: Any = None,
-        **kwargs: Any,
     ) -> Any:
         session = self._ensure_session()
+        url = self._url(path)
+
+        # Proactive refresh before the request if we know the token has expired
+        if self._is_token_expired():
+            _LOGGER.debug("Access token near expiry, proactively refreshing")
+            if not await self._refresh_access_token():
+                raise MinolAuthError(
+                    "Proactive token refresh failed – re-authentication required"
+                )
 
         for attempt in range(2):
             try:
-                kw: dict[str, Any] = {"allow_redirects": True, **kwargs}
-                if method == "POST" and payload is not None:
-                    kw["data"] = json.dumps(payload)
-                    kw["headers"] = {
-                        "Content-Type": "application/json; charset=utf-8",
-                    }
+                kwargs: dict[str, Any] = {
+                    "headers": self._api_headers(),
+                    "allow_redirects": True,
+                }
+                if params:
+                    kwargs["params"] = params
+                if payload is not None:
+                    kwargs["json"] = payload
 
-                async with session.request(method, url, **kw) as resp:
+                _LOGGER.debug("→ %s %s params=%s", method, url, params)
+                async with session.request(method, url, **kwargs) as resp:
+                    _LOGGER.debug("← %s %s HTTP %s", method, url, resp.status)
+
                     if resp.status in (401, 403) and attempt == 0:
-                        _LOGGER.debug("Session expired, re-authenticating")
-                        await self.authenticate()
+                        _LOGGER.warning(
+                            "Received HTTP %s from Minol API – attempting token refresh",
+                            resp.status,
+                        )
+                        if not await self._refresh_access_token():
+                            raise MinolAuthError(
+                                "Token expired and silent refresh failed"
+                                " – re-authentication required"
+                            )
                         continue
 
                     if resp.status != 200:
+                        body = await resp.text()
                         _LOGGER.error(
-                            "Minol %s %s returned HTTP %s",
+                            "Minol API %s %s returned HTTP %s: %s",
                             method,
                             url,
                             resp.status,
+                            body[:400],
                         )
                         return None
 
                     text = await resp.text()
                     if not text.strip():
+                        _LOGGER.debug("Empty response body for %s %s", method, url)
                         return None
-                    return json.loads(text)
+
+                    result = json.loads(text)
+                    _LOGGER.debug(
+                        "Parsed response for %s %s: %s keys / %s items",
+                        method,
+                        url,
+                        len(result) if isinstance(result, dict) else "—",
+                        len(result) if isinstance(result, list) else "—",
+                    )
+                    return result
 
             except aiohttp.ClientError as err:
                 if attempt == 0:
-                    _LOGGER.debug("Request failed (%s), re-authenticating", err)
-                    await self.authenticate()
+                    _LOGGER.debug("Network error on attempt 1 (%s), retrying", err)
                     continue
                 raise MinolConnectionError(
-                    f"Cannot fetch {url}: {err}"
+                    f"Cannot reach Minol API at {url}: {err}"
                 ) from err
 
         return None
+
+    async def _get(self, path: str, **params: str) -> Any:
+        return await self._request("GET", path, params=params or None)
 
     # ------------------------------------------------------------------
     # Public data endpoints
     # ------------------------------------------------------------------
 
-    async def get_user_tenants(self) -> list[dict[str, Any]]:
-        """Return the list of tenant units for the logged-in user."""
-        data = await self._get_json(f"{EMDATA_REST}/getUserTenants")
-        return data if isinstance(data, list) else []
+    async def get_profiles(self) -> list[dict[str, Any]]:
+        """Return all user profiles for the authenticated account.
 
-    async def get_layer_info(
-        self, user_num: str | None = None
-    ) -> dict[str, Any] | None:
-        """Fetch available views and periods for the NE (tenant) layer."""
-        selection = {
-            "userNum": user_num,
-            "layer": "NE",
-            "scale": "CALMONTH",
-            "chartRefUnit": "ABS",
-            "refObject": "PREV_YEAR",
-            "consType": "HEIZUNG",
-            "dashBoardKey": "PE",
-            "valuesInKWH": True,
-        }
-        return await self._post_json(f"{EMDATA_REST}/getLayerInfo", selection)
+        Response shape::
 
-    async def get_dashboard(
-        self, user_num: str | None = None
-    ) -> dict[str, Any] | None:
-        """Fetch the dashboard overview (current + previous year per type)."""
-        selection = {
-            "userNum": user_num,
-            "layer": "NE",
-            "scale": "CALMONTH",
-            "chartRefUnit": "ABS",
-            "refObject": "DIN_AVG",
-            "consType": "HEIZUNG",
-            "dashBoardKey": "PE",
-            "valuesInKWH": True,
-            "dlgKey": "dashboard",
-        }
-        return await self._post_json(f"{EMDATA_REST}/readData", selection)
+            {
+              "meta": {"total": 1, "cursor": ""},
+              "data": [
+                {
+                  "userID": "000000000535",
+                  "eMail": "user@example.com",
+                  "billingUnit": "0607986",
+                  "residentialUnitReference": {
+                    "residentialUnitID": "000002",
+                    "floor": "0000001",
+                    "position": "Mitte"
+                  },
+                  "moveInDate": "2019-11-01",
+                  ...
+                }
+              ]
+            }
+        """
+        result = await self._get("/profiles")
+        if isinstance(result, dict):
+            return result.get("data", [])
+        return []
 
-    async def get_consumption_for_view(
+    async def get_masterdata(
         self,
-        user_num: str | None,
-        view_key: str,
-        cons_type: str,
+        billing_unit_id: str,
+        residential_unit_id: str,
+        startdate: str | None = None,
     ) -> dict[str, Any] | None:
-        """Fetch detailed consumption data for a specific view / type."""
-        is_overview = view_key in ("100EH", "100KWH", "200", "dashboard")
-        selection = {
-            "userNum": user_num,
-            "layer": "NE",
-            "scale": "CALMONTH",
-            "chartRefUnit": "ABS",
-            "refObject": "DIN_AVG" if is_overview else "UPPER_LEVEL",
-            "consType": cons_type,
-            "dashBoardKey": "PE",
-            "valuesInKWH": True,
-            "dlgKey": view_key,
-        }
-        return await self._post_json(f"{EMDATA_REST}/readData", selection)
+        """Fetch master data (billing periods, forecast weights) for a residence."""
+        if startdate is None:
+            startdate = datetime.now(timezone.utc).replace(
+                year=datetime.now(timezone.utc).year - 2
+            ).strftime("%Y-%m-%d")
 
-    async def get_room_data(
+        path = (
+            f"/billingUnit/{billing_unit_id}"
+            f"/residentialUnit/{residential_unit_id}"
+            "/masterdata"
+        )
+        return await self._get(path, startdate=startdate)
+
+    async def get_available_periods(
         self,
-        user_num: str | None,
-        view_key: str,
-        cons_type: str,
-    ) -> dict[str, Any] | None:
-        """Fetch per-room / per-meter data for a RAUM view."""
-        selection = {
-            "userNum": user_num,
-            "layer": "NE",
-            "scale": "CALYEAR",
-            "chartRefUnit": "ABS",
-            "refObject": "NOREF",
-            "consType": cons_type,
-            "dashBoardKey": "PE",
-            "valuesInKWH": True,
-            "dlgKey": view_key,
-        }
-        return await self._post_json(f"{EMDATA_REST}/readData", selection)
+        billing_unit_id: str,
+        residential_unit_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return the list of available consumption periods."""
+        path = (
+            f"/billingUnit/{billing_unit_id}"
+            f"/residentialUnit/{residential_unit_id}"
+            "/consumptions/availableData"
+        )
+        result = await self._get(path)
+        if isinstance(result, dict):
+            return result.get("periods", [])
+        return []
+
+    async def get_consumptions(
+        self,
+        billing_unit_id: str,
+        residential_unit_id: str,
+        startdate: str,
+        enddate: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch consumption data for a date range (YYYY-MM-DD strings)."""
+        path = (
+            f"/billingUnit/{billing_unit_id}"
+            f"/residentialUnit/{residential_unit_id}"
+            "/consumptions"
+        )
+        result = await self._get(path, startdate=startdate, enddate=enddate)
+        if isinstance(result, list):
+            return result
+        return []
+
+    # ------------------------------------------------------------------
+    # Aggregate data method used by the coordinator
+    # ------------------------------------------------------------------
 
     async def get_all_data(self) -> dict[str, Any]:
-        """Collect all data needed by the integration sensors."""
-        tenants = await self.get_user_tenants()
-        user_num = tenants[0]["userNumber"] if tenants else None
-        tenant_info = tenants[0] if tenants else {}
+        """Collect all data needed by the integration sensors.
 
-        layer_info = await self.get_layer_info(user_num)
-        dashboard = await self.get_dashboard(user_num)
+        Returns a dict with keys:
+          - ``profile``: the primary user profile dict
+          - ``billing_unit_id``: str
+          - ``residential_unit_id``: str
+          - ``masterdata``: masterdata response dict
+          - ``latest_consumption``: the most recent consumption period dict
+          - ``available_periods``: list of available period dicts
+        """
+        profiles = await self.get_profiles()
+        if not profiles:
+            raise MinolAuthError(
+                "No profiles returned – cannot fetch consumption data"
+            )
 
-        rooms: dict[str, list[dict[str, Any]]] = {}
-        raum_views = {
-            "100EHRAUM": "HEIZUNG",
-            "200RAUM": "WARMWASSER",
-            "300RAUM": "KALTWASSER",
-        }
-        available_keys = {
-            v["key"] for v in (layer_info or {}).get("views", [])
-        }
-        for view_key, cons_type in raum_views.items():
-            if view_key not in available_keys:
-                continue
-            result = await self.get_room_data(user_num, view_key, cons_type)
-            if result and isinstance(result.get("table"), list):
-                rooms[cons_type] = result["table"]
+        profile = profiles[0]
+        billing_unit_id = profile.get("billingUnit", "")
+        residential_unit_id = (
+            profile.get("residentialUnitReference", {}).get("residentialUnitID", "")
+        )
+
+        if not billing_unit_id or not residential_unit_id:
+            raise MinolAuthError("Profile missing billingUnit or residentialUnitID")
+
+        _LOGGER.debug(
+            "Fetching data for billingUnit=%s residentialUnitID=%s",
+            billing_unit_id,
+            residential_unit_id,
+        )
+
+        masterdata = await self.get_masterdata(billing_unit_id, residential_unit_id) or {}
+        available_periods = await self.get_available_periods(
+            billing_unit_id, residential_unit_id
+        )
+
+        now = datetime.now(timezone.utc)
+        start_month = now.replace(day=1)
+        if start_month.month <= 3:
+            startdate = start_month.replace(
+                year=start_month.year - 1,
+                month=start_month.month + 9,
+            )
+        else:
+            startdate = start_month.replace(month=start_month.month - 3)
+
+        consumptions = await self.get_consumptions(
+            billing_unit_id,
+            residential_unit_id,
+            startdate=startdate.strftime("%Y-%m-%d"),
+            enddate=now.strftime("%Y-%m-%d"),
+        )
+
+        _LOGGER.debug(
+            "Fetched %d available periods, %d consumption periods",
+            len(available_periods),
+            len(consumptions),
+        )
+
+        latest = {}
+        for period in reversed(consumptions):
+            if period.get("statusOverall") == "UVI_AVAILABLE" and period.get(
+                "consumptions"
+            ):
+                latest = period
+                break
+        if not latest and consumptions:
+            latest = consumptions[-1]
+
+        if latest:
+            _LOGGER.debug(
+                "Latest consumption period: %s (status=%s, services=%s)",
+                latest.get("period"),
+                latest.get("statusOverall"),
+                [c.get("service") for c in latest.get("consumptions", [])],
+            )
+        else:
+            _LOGGER.warning("No consumption periods found in the last 3 months")
 
         return {
-            "tenants": tenants,
-            "tenant_info": tenant_info,
-            "user_num": user_num,
-            "layer_info": layer_info or {},
-            "dashboard": dashboard or {},
-            "rooms": rooms,
+            "profile": profile,
+            "billing_unit_id": billing_unit_id,
+            "residential_unit_id": residential_unit_id,
+            "masterdata": masterdata,
+            "latest_consumption": latest,
+            "available_periods": available_periods,
         }
+
+    # ------------------------------------------------------------------
+    # Convenience helpers for sensors
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_service_value(
+        consumption_period: dict[str, Any],
+        service_code: str,
+        field: str = "energyValue",
+    ) -> float | None:
+        """Extract a single value from a consumption period.
+
+        ``service_code`` is one of ``SERVICE_HEATING`` / ``SERVICE_HOT_WATER``
+        / ``SERVICE_COLD_WATER`` (``"100"`` / ``"200"`` / ``"300"``).
+        ``field`` defaults to ``"energyValue"`` (kWh); use ``"serviceValue"``
+        for the raw meter unit (EH or m³).
+        """
+        for cons in consumption_period.get("consumptions", []):
+            if cons.get("service") == service_code:
+                val = cons.get(field)
+                if val is not None:
+                    return float(val)
+        return None

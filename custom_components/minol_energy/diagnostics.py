@@ -5,22 +5,22 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from . import MinolConfigEntry
+from .const import CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN
 
-REDACT_CONFIG = {CONF_USERNAME, CONF_PASSWORD}
+REDACT_CONFIG = {CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN}
 REDACT_DATA = {
-    "name",
+    "userID",
+    "eMail",
+    "firstName",
+    "lastName",
+    "street",
+    "houseNumber",
+    "city",
+    "zip",
     "email",
-    "addrStreet",
-    "addrHouseNum",
-    "addrCity",
-    "addrPostalCode",
-    "userNumber",
-    "lgnr",
-    "nenr",
 }
 
 

@@ -12,3 +12,6 @@ __pycache__/
 
 # Editor
 .DS_Store
+
+# APK analysis artifacts
+debug/

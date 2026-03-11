@@ -27,7 +27,7 @@ def _get_update_interval(entry: ConfigEntry) -> timedelta:
 
 
 class MinolDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Shared data fetcher for the Minol eMonitoring portal."""
+    """Shared data fetcher for the Minol mobile app API."""
 
     def __init__(
         self, hass: HomeAssistant, client: MinolApiClient, entry: ConfigEntry
@@ -42,13 +42,28 @@ class MinolDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
 
     async def _async_update_data(self) -> dict[str, Any]:
+        _LOGGER.debug("Starting data refresh for entry %s", self.entry.entry_id)
         try:
-            return await self.client.get_all_data()
+            data = await self.client.get_all_data()
+            _LOGGER.debug(
+                "Data refresh complete: billingUnit=%s residentialUnit=%s"
+                " availablePeriods=%d latestPeriod=%s",
+                data.get("billing_unit_id"),
+                data.get("residential_unit_id"),
+                len(data.get("available_periods", [])),
+                data.get("latest_consumption", {}).get("period"),
+            )
+            return data
         except MinolAuthError as err:
+            _LOGGER.warning(
+                "Authentication error during data refresh – triggering reauth: %s", err
+            )
             raise ConfigEntryAuthFailed(
                 f"Authentication failed: {err}"
             ) from err
         except MinolConnectionError as err:
+            _LOGGER.error("Connection error during data refresh: %s", err)
             raise UpdateFailed(f"Connection error: {err}") from err
         except Exception as err:
+            _LOGGER.exception("Unexpected error during data refresh")
             raise UpdateFailed(f"Unexpected error: {err}") from err

@@ -1,121 +1,65 @@
-# Minol Energy - Home Assistant Integration
+# Minol Energy — Home Assistant Integration
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-blue.svg)](https://hacs.xyz/)
 [![HA Version](https://img.shields.io/badge/HA-2024.1%2B-blue.svg)](https://www.home-assistant.io/)
 
 A custom [Home Assistant](https://www.home-assistant.io/) integration that reads
-consumption data from the **Minol eMonitoring** tenant portal
-([webservices.minol.com](https://webservices.minol.com/)).
+consumption data from the **Minol MinolApp mobile API** (Mulesoft Experience API).
 
-The portal runs on SAP NetWeaver. This integration authenticates via
-`j_security_check`, then queries the internal REST API at
-`/minol.com~kundenportal~em~web/rest/EMData` that the portal's SAPUI5
-front-end uses.
+Authentication uses the same Azure B2C OAuth2 flow as the official Minol iOS/Android app.
+Tokens are refreshed silently in the background — you only need to log in once.
 
 ---
 
 ## Features
 
-- **Energy Dashboard compatible** — consumption sensors use `TOTAL_INCREASING` and can be added directly to the HA Energy Dashboard
-- **Per-room / per-meter sensors** — individual meters for heating, hot water and cold water
-- **Cost estimation** — configure energy prices to see estimated costs
-- **Configurable update interval** — adjust polling frequency (15 min to 24 h)
-- **Reauthentication flow** — HA automatically prompts for new credentials when the session expires
-- **Diagnostics** — export anonymized data for debugging via HA diagnostics
-- **Multilingual** — English and German translations
+- **Energy Dashboard compatible** — consumption sensors use `TOTAL_INCREASING` and can be added to the HA Energy Dashboard
+- **Heating, hot water, and cold water** sensors with kWh and volume values
+- **CO₂ tracking** — carbon intensity sensor per service
+- **Cost estimation** — configure energy prices to see estimated monthly costs
+- **Configurable update interval** — 15 min to 24 h polling
+- **Silent token refresh** — access tokens are renewed automatically; the refresh token is good for 14 days
+- **Reauthentication flow** — HA prompts for a new login if the refresh token expires
+- **Diagnostics** — export anonymized data for debugging
+- **English and German** translations
 
 ---
 
 ## Sensors
 
-For each consumption type available on your account, the following sensors are
-created:
+For each service type available on your account (heating, hot water, cold water):
 
-| Sensor | Example value | Description |
+| Sensor | Unit | Description |
 |---|---|---|
-| Heating Current Year | 1175.42 kWh | Total heating consumption this year |
-| Heating Previous Year | 1171.11 kWh | Total heating consumption last year |
-| Heating per m² Current Year | 17.31 kWh/m² | Heating per square metre (current) |
-| Heating per m² Previous Year | 17.25 kWh/m² | Heating per square metre (previous) |
-| Heating DIN Average | 41.65 kWh/m² | DIN reference average for the building |
-| Heating Building Share % | 12 % | Your share of the building's total |
-| Hot Water Current Year | 345.35 kWh | Hot water energy this year |
-| Hot Water Previous Year | 347.62 kWh | Hot water energy last year |
-| Hot Water per m² Current Year | 5.09 kWh/m² | Hot water per m² |
-| Hot Water per m² Previous Year | 5.12 kWh/m² | Hot water per m² (previous) |
-| Hot Water DIN Average | 9.63 kWh/m² | DIN reference |
-| Hot Water Building Share % | 12 % | Your share |
-| Cold Water Current Year | 21.47 m³ | Cold water volume this year |
-| Cold Water Previous Year | 20.60 m³ | Cold water volume last year |
-| Cold Water per m² Current Year | 0.32 m³/m² | Cold water per m² |
-| Cold Water per m² Previous Year | 0.30 m³/m² | Cold water per m² (previous) |
-| Cold Water DIN Average | 0.37 m³/m² | DIN reference |
-| Cold Water Building Share % | 15 % | Your share |
-| Tenant Info | Street, ... | Address with attributes (name, floor, move-in) |
+| Heating Latest Month | kWh | Energy consumption for the most recent complete month |
+| Heating CO₂ Latest Month | kg | CO₂ equivalent for heating |
+| Hot Water Latest Month | kWh | Hot water energy consumption |
+| Hot Water CO₂ Latest Month | kg | CO₂ equivalent for hot water |
+| Cold Water Latest Month | m³ | Cold water volume consumption |
+| Cold Water CO₂ Latest Month | kg | CO₂ equivalent for cold water |
 
-### Per-room / per-meter sensors
-
-For each individual meter registered to your unit, a sensor is created with the
-weighted consumption value. The sensor name includes the room and last 4 digits
-of the meter serial number.
-
-| Sensor example | Example value | Description |
-|---|---|---|
-| Heating Living room (6910) | 973.83 kWh | Weighted heating consumption for one HKV |
-| Heating Bedroom (6448) | 456.12 kWh | Weighted heating for bedroom meter |
-| Hot Water Kitchen (3331) | 12.45 kWh | Hot water meter in kitchen |
-| Cold Water Bathroom (3364) | 5.20 m³ | Cold water meter in bathroom |
-
-Each room sensor carries these extra attributes: `room`, `meter_serial`,
-`reading`, `initial_reading`, `raw_consumption`, `weighting_factor`, `unit`.
-
-The exact set of sensors depends on which meter types your property has.
-
-### Cost sensors
-
-When energy prices are configured in the integration options, cost sensors are
-created automatically:
-
-| Sensor example | Example value | Description |
-|---|---|---|
-| Heating Cost | 117.54 € | Current year heating × configured price |
-| Hot Water Cost | 34.54 € | Current year hot water × configured price |
-| Cold Water Cost | 96.62 € | Current year cold water × configured price |
-
-Cost sensors include a `price_per_unit` attribute showing the configured rate.
-
----
-
-## Energy Dashboard
-
-The following sensors are compatible with the HA Energy Dashboard
-(**Settings > Dashboards > Energy**):
-
-- **Heating / Hot Water Current Year** — add under gas or individual consumption
-- **Cold Water Current Year** — add under water consumption
-- **Per-room / per-meter sensors** — for detailed per-meter tracking
-
-These sensors use `SensorStateClass.TOTAL_INCREASING` and are automatically
-offered when configuring the Energy Dashboard.
+Which sensors appear depends on which services your property has metered.
+Cost sensors are created automatically when a non-zero price is set in Options.
 
 ---
 
 ## How it works
 
 ```
-Home Assistant                      Minol Portal (SAP NetWeaver)
- ┌──────────────┐    aiohttp        ┌───────────────────────────┐
- │ Coordinator  │ ─────────────────►│ j_security_check (login)  │
- │ (polls 1/hr) │                   │                           │
- │              │ GET getUserTenants│ → [{userNumber, addr...}] │
- │              │ POST getLayerInfo │ → {views, periods, scales} │
- │              │ POST readData     │ → {dashboard: [...]}      │
- │              │ (dashboard)       │                           │
- │              │ POST readData     │ → {table: [...]}          │
- └──────┬───────┘ (RAUM views)      └───────────────────────────┘
-        │
-   19+ sensor entities
-   (dashboard + per-meter + cost)
+Home Assistant                          Minol backend
+ ┌─────────────────┐   Bearer token    ┌──────────────────────────────────────┐
+ │  Coordinator    │──────────────────►│ Mulesoft Experience API              │
+ │  (polls 1/hr)   │                   │  GET /api/app/profiles               │
+ │                 │◄──────────────────│  GET /api/app/billingUnit/{}/...      │
+ └────────┬────────┘   JSON data       │    /masterdata                       │
+          │                            │    /consumptions/availableData        │
+     sensor entities                   │    /consumptions?startdate=…&enddate=…│
+                                       └──────────────────────────────────────┘
+
+ ┌─────────────────┐
+ │  Azure B2C      │  OAuth2 Authorization Code + PKCE
+ │  (minolauth)    │  access_token valid 1 h, refresh_token 14 days
+ └─────────────────┘
 ```
 
 ---
@@ -125,30 +69,39 @@ Home Assistant                      Minol Portal (SAP NetWeaver)
 ### Via HACS (recommended)
 
 1. Open **HACS** in Home Assistant.
-2. Go to **Integrations** > three-dot menu > **Custom repositories**.
-3. Enter the repository URL, category **Integration**.
-4. Click **Add**, then search for **Minol Energy** and click **Download**.
+2. **Integrations** → three-dot menu → **Custom repositories**.
+3. Enter the repository URL, category **Integration**, click **Add**.
+4. Search for **Minol Energy** and click **Download**.
 5. **Restart Home Assistant.**
 
 ### Manual
 
-Copy `custom_components/minol_energy/` into your HA config directory and restart.
+Copy `custom_components/minol_energy/` into your HA `config/custom_components/` directory and restart.
 
 ---
 
-## Configuration
+## Setup
 
-1. **Settings** > **Devices & Services** > **Add Integration** > **Minol Energy**.
-2. Enter your e-mail and password (same as [webservices.minol.com](https://webservices.minol.com/)).
-3. Done. Sensors appear automatically.
+The integration uses the same login flow as the Minol mobile app (Azure B2C OAuth2 with PKCE).
+There is no username/password field — you authenticate via your browser once.
 
-### Options
+1. **Settings → Devices & Services → Add Integration → Minol Energy**
+2. Click the login link shown in the setup form.
+3. Sign in with your Minol account in the browser.
+4. After signing in, the browser navigates to a Postman callback page. Copy the full URL from the address bar (it starts with `https://oauth.pstmn.io/v1/callback?code=…`).
+5. Paste it into the field in HA and click **Submit**.
+
+Tokens are stored in the config entry and refreshed automatically. You will only need to repeat this if you haven't used HA for more than 14 days.
+
+---
+
+## Options
 
 After setup, click **Configure** on the integration to adjust:
 
 | Option | Default | Description |
 |---|---|---|
-| Update interval | 60 min | How often to poll the Minol portal (15–1440 min) |
+| Update interval | 60 min | How often to poll the Minol API (15–1440 min) |
 | Heating price | 0.00 €/kWh | Price per kWh for heating cost estimation |
 | Hot water price | 0.00 €/kWh | Price per kWh for hot water cost estimation |
 | Cold water price | 0.00 €/m³ | Price per m³ for cold water cost estimation |
@@ -161,16 +114,14 @@ Setting a price to `0` disables the corresponding cost sensor.
 
 | Problem | Solution |
 |---|---|
-| **"Cannot connect"** | Verify you can log in at [webservices.minol.com](https://webservices.minol.com/) in Chrome. |
-| **"Invalid username or password"** | The integration checks for the `MYSAPSSO2` cookie. If SAP doesn't issue it, credentials are wrong. |
-| **No sensors / all unknown** | Your portal account may not have eMonitoring enabled. Contact Minol. |
-| **Session expired** | The integration will automatically prompt you to re-enter your password. |
-
-### Diagnostics
-
-Go to **Settings > Devices & Services > Minol Energy > three-dot menu > Download diagnostics** to export anonymized debug data. Sensitive fields (name, email, address) are redacted automatically.
+| **"Cannot connect"** | Check your internet connection and that the Minol app works on your phone. |
+| **"Authentication failed"** | Your session may have expired. Click **Re-authenticate** on the integration card. |
+| **No sensors** | Your Minol account may not have eMonitoring enabled. Contact Minol customer support. |
+| **Sensors show unknown** | No consumption data was found for the last 3 months. Check the Minol app. |
 
 ### Debug logging
+
+Add to `configuration.yaml`:
 
 ```yaml
 logger:
@@ -178,19 +129,41 @@ logger:
     custom_components.minol_energy: debug
 ```
 
+Logs include every API request/response, token expiry times, and refresh attempts.
+
+### Diagnostics
+
+**Settings → Devices & Services → Minol Energy → three-dot menu → Download diagnostics**
+
+Sensitive fields (tokens, email) are redacted automatically.
+
 ---
 
-## Reverse-engineered API reference
+## Development
 
-All endpoints are on `https://webservices.minol.com`.
+### Running live tests
 
-| Method | Path | Body | Returns |
-|---|---|---|---|
-| GET | `.../rest/EMData/getUserTenants` | - | `[{lgnr, nenr, name, userNumber, addr*...}]` |
-| POST | `.../rest/EMData/getLayerInfo` | `{userNum, layer, scale, consType...}` | `{views, periods, scales, head...}` |
-| POST | `.../rest/EMData/readData` | `{userNum, layer, dlgKey, consType...}` | `{table, chart, dashboard}` |
-| GET | `.../rest/NuData/getShowInfoState` | - | `{result: bool}` |
-| GET | `.../rest/NuData/getPushServiceState` | - | `{result: bool}` |
+The test suite makes real API calls. You need a valid token first:
+
+```bash
+uv run python scripts/get_token.py
+```
+
+The script opens the Minol B2C login URL. Sign in, copy the redirect URL from the browser
+address bar, paste it when prompted, and press Enter. The script prints two `export` commands:
+
+```bash
+export MINOL_ACCESS_TOKEN="eyJ..."
+export MINOL_REFRESH_TOKEN="eyJ..."
+```
+
+Run those, then execute the tests:
+
+```bash
+uv run pytest tests/test_api_live.py -v -s
+```
+
+Tests are automatically skipped when `MINOL_ACCESS_TOKEN` is not set or when running in CI.
 
 ---
 
