@@ -1,11 +1,11 @@
 {
   "domain": "minol_energy",
   "name": "Minol Energy",
-  "codeowners": ["@your_github_username"],
+  "codeowners": ["@dewey"],
   "config_flow": true,
-  "documentation": "https://github.com/your_username/minol_energy",
+  "documentation": "https://github.com/dewey/Minol",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/your_username/minol_energy/issues",
+  "issue_tracker": "https://github.com/dewey/Minol/issues",
   "requirements": [],
   "version": "0.3.0"
 }
