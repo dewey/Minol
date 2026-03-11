@@ -1,18 +1,19 @@
-"""API client for the Minol tenant portal (SAP NetWeaver eMonitoring)."""
+"""API client for the Minol tenant portal."""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
 from .const import (
+    B2C_ENTRY_URL,
     BASE_URL,
     EMDATA_REST,
-    J_SECURITY_CHECK_URL,
-    LOGIN_URL,
     NUDATA_REST,
     USER_AGENT,
 )
@@ -28,13 +29,49 @@ class MinolConnectionError(Exception):
     """Raised when the Minol portal cannot be reached."""
 
 
+def _extract_b2c_settings(html: str) -> dict[str, Any]:
+    """Extract the Azure B2C page settings JSON from the login page HTML.
+
+    B2C login pages embed a JSON config object in a script tag, typically as
+    ``$Config={...}`` or ``var SETTINGS = {...}``.
+    """
+    for pattern in (
+        r"\$Config\s*=\s*(\{[^<]+?\})\s*[;\n]",
+        r"var\s+SETTINGS\s*=\s*(\{[^<]+?\})\s*[;\n]",
+    ):
+        match = re.search(pattern, html, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))  # type: ignore[no-any-return]
+            except json.JSONDecodeError:
+                continue
+    return {}
+
+
+def _b2c_base_url(url: str) -> str:
+    """Return ``scheme://host/tenant/policy`` from a full B2C URL.
+
+    Example::
+
+        https://minolauth.b2clogin.com/minolauth.onmicrosoft.com/B2C_1A_XYZ/api/...
+        → https://minolauth.b2clogin.com/minolauth.onmicrosoft.com/B2C_1A_XYZ
+    """
+    parsed = urlparse(url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) >= 2:
+        return f"{parsed.scheme}://{parsed.netloc}/{parts[0]}/{parts[1]}"
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 class MinolApiClient:
     """Async client for the Minol eMonitoring portal.
 
-    Authentication flow:
-      1. GET the SAP NetWeaver login page to seed session cookies.
-      2. POST credentials to ``j_security_check``.
-      3. Verify MYSAPSSO2 cookie was issued.
+    Authentication flow (Azure B2C / SAML):
+      1. GET ``/?redirect2=true`` → follows redirects to Azure B2C login page.
+      2. Parse ``$Config`` settings: CSRF token, transId, policy.
+      3. POST credentials to the B2C SelfAsserted endpoint.
+      4. GET the confirmed endpoint → triggers SAML redirect back to Minol.
+      5. Verify ``MYSAPSSO2`` cookie was issued.
 
     Data flow (for a *tenant* / Mieter user):
       1. GET ``EMData/getUserTenants`` → tenant list with ``userNumber``.
@@ -69,33 +106,86 @@ class MinolApiClient:
     # ------------------------------------------------------------------
 
     async def authenticate(self) -> bool:
-        """Login via SAP j_security_check.  Returns True on success."""
+        """Login via Azure B2C / SAML.  Returns True on success.
+
+        Flow:
+          1. GET ``B2C_ENTRY_URL`` (``/?redirect2=true``) → follows redirects
+             to the Azure AD B2C login page at ``minolauth.b2clogin.com``.
+          2. Parse ``$Config`` JSON embedded in the page to obtain the CSRF
+             token, transaction-ID and policy name.
+          3. POST credentials to the B2C *SelfAsserted* endpoint.
+          4. GET the *confirmed* endpoint → B2C redirects to the Minol SAML
+             ACS, which issues the ``MYSAPSSO2`` session cookie.
+          5. Verify ``MYSAPSSO2`` is present in the cookie jar.
+        """
         session = self._ensure_session()
 
         try:
-            # Seed SAP cookies.
-            async with session.get(LOGIN_URL, allow_redirects=True):
+            # 1. Reach the B2C login page.
+            async with session.get(B2C_ENTRY_URL, allow_redirects=True) as resp:
+                b2c_page_url = str(resp.url)
+                html = await resp.text()
+
+            _LOGGER.debug("Reached B2C login page: %s", b2c_page_url)
+
+            # 2. Parse page settings.
+            settings = _extract_b2c_settings(html)
+            if not settings:
+                raise MinolAuthError(
+                    "Could not parse Azure B2C login page – $Config not found"
+                )
+
+            csrf = settings.get("csrf", "")
+            trans_id = settings.get("transId", "")
+            policy = settings.get("policy", "")
+            base = _b2c_base_url(b2c_page_url)
+
+            if not (csrf and trans_id and policy):
+                raise MinolAuthError(
+                    "Incomplete B2C settings: "
+                    f"csrf={bool(csrf)}, transId={bool(trans_id)}, "
+                    f"policy={bool(policy)}"
+                )
+
+            # 3. POST credentials to SelfAsserted endpoint.
+            self_asserted_url = f"{base}/SelfAsserted?tx={trans_id}&p={policy}"
+            async with session.post(
+                self_asserted_url,
+                data={
+                    "request_type": "RESPONSE",
+                    "signInName": self._username,
+                    "password": self._password,
+                },
+                headers={
+                    "X-CSRF-TOKEN": csrf,
+                    "Referer": b2c_page_url,
+                },
+                allow_redirects=False,
+            ) as resp:
+                body = await resp.text()
+                try:
+                    result: dict[str, Any] = json.loads(body)
+                except json.JSONDecodeError:
+                    result = {}
+
+                if result.get("status") != "200":
+                    msg = result.get("message", "Invalid username or password")
+                    raise MinolAuthError(f"Authentication failed: {msg}")
+
+            # 4. Confirm → triggers SAML redirect back to Minol ACS.
+            confirmed_url = (
+                f"{base}/api/{trans_id}/confirmed"
+                f"?csrf_token={csrf}&tx={trans_id}&p={policy}"
+            )
+            async with session.get(confirmed_url, allow_redirects=True):
                 pass
 
-            # Submit credentials.
-            async with session.post(
-                J_SECURITY_CHECK_URL,
-                data={"j_user": self._username, "j_password": self._password},
-                allow_redirects=True,
-            ) as resp:
-                # Check for the SSO cookie that SAP issues on success.
-                cookie_names = {c.key for c in session.cookie_jar}
-                if "MYSAPSSO2" not in cookie_names:
-                    raise MinolAuthError(
-                        "Authentication failed – no MYSAPSSO2 cookie received"
-                    )
-
-                # Extra safety: make sure we weren't bounced back to logon.
-                final = str(resp.url).lower()
-                if "j_security_check" in final:
-                    raise MinolAuthError(
-                        "Authentication failed – redirected back to login"
-                    )
+            # 5. Verify MYSAPSSO2 cookie.
+            cookie_names = {c.key for c in session.cookie_jar}
+            if "MYSAPSSO2" not in cookie_names:
+                raise MinolAuthError(
+                    "Authentication failed – no MYSAPSSO2 cookie received"
+                )
 
         except aiohttp.ClientError as err:
             raise MinolConnectionError(

@@ -3,13 +3,10 @@
 DOMAIN = "minol_energy"
 
 BASE_URL = "https://webservices.minol.com"
-LOGIN_URL = (
-    f"{BASE_URL}/irj/servlet/prt/portal/prttarget/uidpwlogon"
-    "/prtroot/com.sap.portal.navigation.portallauncher.default"
-)
-J_SECURITY_CHECK_URL = (
-    f"{BASE_URL}/irj/servlet/prt/portal/prtroot/j_security_check"
-)
+
+# Azure B2C / SAML authentication entry point.
+# GET this URL (with redirects) to reach the B2C login page.
+B2C_ENTRY_URL = f"{BASE_URL}/?redirect2=true"
 EMDATA_REST = f"{BASE_URL}/minol.com~kundenportal~em~web/rest/EMData"
 NUDATA_REST = f"{BASE_URL}/minol.com~kundenportal~em~web/rest/NuData"
 
