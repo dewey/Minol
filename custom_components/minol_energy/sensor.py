@@ -105,7 +105,14 @@ async def async_setup_entry(
         MinolTenantInfoSensor(coordinator, entry),
     ]
 
+    latest = coordinator.data.get("latest_consumption", {})
+    active_services = {
+        c.get("service") for c in latest.get("consumptions", [])
+    }
+
     for svc in _SERVICES:
+        if svc.service_code not in active_services:
+            continue
         # Latest month energy / volume
         entities.append(
             MinolConsumptionSensor(
