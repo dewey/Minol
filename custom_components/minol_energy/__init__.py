@@ -8,10 +8,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .api import MinolApiClient
+from .const import CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN
+from .coordinator import MinolDataCoordinator, _get_update_interval
 
 _LOGGER = logging.getLogger(__name__)
-from .const import CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, DOMAIN
-from .coordinator import MinolDataCoordinator, _get_update_interval
 
 PLATFORMS: list[str] = ["sensor"]
 

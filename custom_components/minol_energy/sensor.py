@@ -14,7 +14,6 @@ from typing import Any
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
-    SensorEntityDescription,
     SensorStateClass,
 )
 from homeassistant.const import UnitOfEnergy, UnitOfMass, UnitOfVolume
@@ -23,7 +22,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import MinolConfigEntry
-from .api import MinolApiClient
 from .const import (
     CONF_COLD_WATER_PRICE,
     CONF_HEATING_PRICE,
