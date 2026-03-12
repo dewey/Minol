@@ -123,7 +123,7 @@ async def async_setup_entry(
                 suffix="latest_month",
                 name=f"{svc.type_text} Latest Month",
                 unit=svc.energy_unit,
-                state_class=SensorStateClass.MEASUREMENT,
+                state_class=SensorStateClass.TOTAL,
                 device_class=svc.device_class,
                 icon=svc.icon,
             )
