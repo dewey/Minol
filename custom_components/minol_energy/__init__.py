@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .api import MinolApiClient
+
+_LOGGER = logging.getLogger(__name__)
 from .const import CONF_ACCESS_TOKEN, CONF_REFRESH_TOKEN, DOMAIN
 from .coordinator import MinolDataCoordinator, _get_update_interval
 
